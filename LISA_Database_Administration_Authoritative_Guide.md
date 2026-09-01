@@ -3,7 +3,7 @@
 **System:** OSHA Laboratory Information System (LISA / LIMS)  
 **Primary database areas covered:** LIMS transactional schema, QC (`QC_DEV2`), OIS staging/transfer support, analyst/user administration  
 **Purpose:** Stand-alone operational reference for a human DBA or an LLM assisting a DBA.  
-**Basis:** Consolidated from the supplied LISA Maintenance presentations, LIMS DSD/ERD diagrams, and a verified live-database QC maintenance session on 2026-09-01.
+**Basis:** Consolidated from the supplied LISA Maintenance presentations, LIMS DSD/ERD diagrams, and verified live-database administration sessions.
 
 > **Scope and authority.** This guide is authoritative for the administration tasks actually documented in the supplied materials and for the QC unpost/theoretical-value workflow verified interactively against the live database. It does **not** claim to document every object, procedure, form, batch job, or business rule in LISA. Where the source material is silent, this guide says so rather than inventing behavior.
 
@@ -36,6 +36,8 @@ Prefer the supported application workflow when it can safely perform the request
 
 Changes made in SQL Developer are session-local until committed. Use `ROLLBACK;` to abandon unwanted uncommitted changes. After `COMMIT;`, reversing a change requires a compensating `UPDATE`, `INSERT`, or `DELETE`.
 
+This transaction pattern primarily applies to transactional DML such as `UPDATE`, `INSERT`, and `DELETE`. Oracle account/schema administration commands such as `ALTER USER`, `CREATE USER`, and `GRANT` are DDL/security administration and have different transaction semantics; do not rely on `ROLLBACK` to reverse them. Verify their effects through the appropriate account or security checks.
+
 **Recommended DBA pattern for every data correction:**
 
 1. Identify the target rows with a `SELECT`.
@@ -53,6 +55,8 @@ Never assume that an application label such as *posted*, *assigned*, or *finishe
 ### 1.2 SQL conventions
 
 A line beginning with `--` is a comment. A `--` appearing within a line comments out the remainder of that line. Some PowerPoint examples contain typographic (“smart”) single quotes; replace them with normal ASCII `'` quotes if SQL Developer reports syntax errors.
+
+**Placeholder convention:** Text enclosed in angle brackets, such as `<USERNAME>`, `<SMST_ID>`, or `<OBJECT_NAME>`, represents a value that must be replaced before execution. The angle brackets themselves are not part of the SQL. Never execute an example containing unresolved `<...>` placeholders.
 
 ### 1.3 Schema discovery
 
@@ -990,7 +994,7 @@ Then use the resulting rows to construct `ois_list.par` and run the no-generatio
 
 ---
 
-## 14. Adding analysts and database users
+## 14. Analyst and Oracle account administration
 
 A new analyst needs both an Oracle user account and an entry in the LISA analyst table to assign, edit, and review samples. Creating users requires Oracle `CREATE USER` privilege and may entail additional security-training requirements.
 
@@ -1051,6 +1055,91 @@ SELECT DISTINCT title
 FROM l_analysts
 ORDER BY 1;
 ```
+
+
+### 14.3 `LISA-USER-001` — Unlock an existing LISA Oracle account
+
+**Purpose:** Restore login access when an existing LISA user's Oracle account has become locked.
+
+**When to use:** A known LISA user reports that the account is locked and the requested action is to unlock the existing Oracle account.
+
+**Do not use when:** The user's Oracle `LOGON_ID` has not been verified, the account does not exist, the reported problem has not been established as an account-lock condition, or the request requires a password reset or another credential change. Unlocking an account and resetting its password are separate administrative actions.
+
+**Preferred mechanism:** Supported GUI administration may be used when available. For appropriately privileged DBA/support personnel, Oracle SQL can unlock the existing account directly.
+
+**Required identifiers:** Verified Oracle username / LISA analyst `LOGON_ID`.
+
+**Objects affected:** Oracle database user account. No LIMS transactional data is modified.
+
+**Evidence / status:** `LIMS.ANALYSTS.LOGON_ID` is SOURCE-DOCUMENTED. `ALTER USER <USERNAME> ACCOUNT UNLOCK` is LIVE-VERIFIED 2026-09-01 for an existing LISA Oracle account. The optional `DBA_USERS` status queries below are standard Oracle administrative guidance but were **not live-verified in the documented LISA session**; use them only when the support account has authorized access to that view.
+
+#### Pre-change identification
+
+Do not infer an Oracle username from a person's name or email address. If the `LOGON_ID` is not already known and verified, retrieve it from the LISA analyst record:
+
+```sql
+SELECT analyst_id,
+       last_name,
+       first_name,
+       e_mail,
+       logon_id
+FROM l_analysts
+WHERE UPPER(last_name) = UPPER('<LAST_NAME>')
+  AND UPPER(first_name) = UPPER('<FIRST_NAME>');
+```
+
+Confirm that the returned analyst is the intended user before continuing. If multiple rows are returned, use additional verified identifying information rather than guessing which account is correct.
+
+> **Placeholder reminder:** `<USERNAME>`, `<LAST_NAME>`, and similar angle-bracketed text in this guide are placeholders. Replace the entire placeholder, including the angle brackets, with the verified value. Do not enter the `<` or `>` characters in executable SQL.
+
+#### Optional pre-change account-status verification
+
+If the DBA/support account has authorized access to Oracle account metadata, the following query can be used to inspect the account before modification. This query was not live-verified during the 2026-09-01 LISA session:
+
+```sql
+SELECT username,
+       account_status,
+       lock_date,
+       expiry_date
+FROM dba_users
+WHERE username = UPPER('<USERNAME>');
+```
+
+Expected precondition: exactly one row for the intended Oracle account and a status consistent with the reported lock condition. If `DBA_USERS` is not accessible, do not treat the resulting privilege error as evidence that the user does not exist; use an authorized administrative mechanism instead.
+
+#### Modification SQL
+
+After verifying the Oracle username, unlock the account:
+
+```sql
+ALTER USER <USERNAME> ACCOUNT UNLOCK;
+```
+
+This statement form was successfully used to unlock an existing LISA Oracle account on 2026-09-01.
+
+**Expected result:** Oracle accepts the account alteration for the verified user. Treat this as SQL/administrative execution success, not by itself as end-to-end LISA access success. When authorized, verify the resulting account status; ultimately, have the user confirm a normal LISA login with the credential they are expected to use. If Oracle reports an error, stop and investigate the actual error rather than assuming another password reset or unlock is required.
+
+#### Verification
+
+When authorized access to `DBA_USERS` is available, re-run the account-status query and confirm that the account is no longer locked. Because this metadata verification was not exercised during the documented 2026-09-01 session, treat it as useful verification guidance rather than a live-verified LISA step. The practical end-to-end verification is for the user to attempt a normal LISA login with the credential they are expected to use.
+
+#### Password-reset distinction
+
+`ACCOUNT UNLOCK` does not itself reset the user's password. If the password has already been reset and the subsequent problem is only an account lock, perform the narrowest requested operation: unlock the account without changing the password again. If authentication still fails after a successful unlock, obtain the exact resulting error before performing additional credential changes.
+
+#### Commit point / rollback / recovery
+
+`ALTER USER` is Oracle DDL and is not part of the transactional LIMS data-correction workflow described in Section 1.1. Do not rely on `ROLLBACK` to reverse the operation. Verify the resulting account state and/or user login. If an unintended account was altered, investigate and use the appropriate authorized account-management action rather than attempting a transactional rollback.
+
+#### Known side effects
+
+The live-verified operation changes the Oracle account lock state. No LIMS transactional records are modified. No additional LISA-specific side effects were established during the 2026-09-01 verification.
+
+#### Placeholder troubleshooting note
+
+If Oracle returns `ORA-01935: missing user or role name` while following an `ALTER USER` example, first verify that an angle-bracket placeholder was not entered literally. `<USERNAME>` means substitute the verified Oracle username; the `<` and `>` characters are not executable SQL syntax. This placeholder mistake was observed during the 2026-09-01 session.
+
+**Date live-verified:** 2026-09-01.
 
 ---
 
@@ -1150,6 +1239,7 @@ Stable procedure identifiers should be used in tickets/change logs where applica
 | `LISA-OIS-IN-001` Inbound OIS troubleshooting | staging tables, MapForce inbound job |
 | `LISA-OIS-OUT-001` Outbound OIS troubleshooting | `lisarpt.OIS_XML_RELEASE`, `ois_list.par`, response batch file |
 | Add analyst | Oracle account + `LIMS.ANALYSTS` row |
+| `LISA-USER-001` Unlock existing LISA account | verify `LIMS.ANALYSTS.LOGON_ID`; `ALTER USER ... ACCOUNT UNLOCK` |
 | Discover unknown object | `ALL_OBJECTS`, `ALL_SYNONYMS`, `ALL_TAB_COLUMNS`, `ALL_SOURCE` |
 
 ---
@@ -1163,6 +1253,7 @@ This guide consolidates the following supplied materials:
 - **DSD12.pdf**, LIMS physical/data-structure diagram showing tables, columns, constraints, and relationships.
 - **ERD5.pdf**, LIMS entity-relationship diagram (modified 2001) showing the conceptual relational model.
 - **Verified DBA session, 2026-09-01:** QC 521028–521031 unpost/theoretical-value correction, including live synonym/table discovery and inspection of `QC_DEV2.UPDATE_PRECS2`.
+- **Verified DBA session, 2026-09-01:** an existing LISA Oracle account was successfully unlocked using `ALTER USER ... ACCOUNT UNLOCK`.
 
 ### Verified 2026-09-01 QC findings retained as reusable knowledge
 
