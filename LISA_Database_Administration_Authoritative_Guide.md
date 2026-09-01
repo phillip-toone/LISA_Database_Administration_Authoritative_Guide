@@ -1,5 +1,7 @@
 # LISA Database Administration Authoritative Guide
 
+**Version:** 0.9 Review Consolidation — 2026-09-01  
+
 **System:** OSHA Laboratory Information System (LISA / LIMS)  
 **Primary database areas covered:** LIMS transactional schema, QC (`QC_DEV2`), OIS staging/transfer support, analyst/user administration  
 **Purpose:** Stand-alone operational reference for a human DBA or an LLM assisting a DBA.  
@@ -10,6 +12,27 @@
 ---
 
 ## 1. Operating principles
+
+### 1.0 Evidence and authority labels
+
+This guide uses the following evidence labels. When facts conflict, **current live database metadata and verified behavior take precedence over historical diagrams and examples**, but discrepancies must be recorded rather than silently erased.
+
+- **SOURCE-DOCUMENTED** — stated or shown in the supplied Maintenance, DSD, or ERD material.
+- **LIVE-VERIFIED 2026-09-01** — observed against the live database during the documented DBA session.
+- **SOURCE-DOCUMENTED + LIVE-VERIFIED** — supported by both.
+- **HISTORICAL** — useful legacy information that may no longer reflect the current environment.
+- **ENVIRONMENT-DEPENDENT** — server names/IPs, paths, schedules, roles, profiles, recipients, or other values that must be verified before use.
+- **INFERRED** — a reasoned conclusion not explicitly established by a source; do not treat it as a database rule without verification.
+- **SOURCE-DEFECT** — an apparent error or contradiction in inherited documentation; do not execute it without independent verification.
+
+### 1.0.1 Values an operator or LLM must never infer
+
+Never infer an `SMST_ID`, `SMPL_ID`, `ANLY_ID`, `LBST_ID`, `QCSMPL_ID`, `SPKSOL_ID`, `ANALYTE_ID`, physical object behind a synonym, current server address/path, current Oracle role/profile, status-code meaning, foreign-key target, or side effect of an undocumented procedure. Retrieve or verify it first.
+
+### 1.0.2 Preferred mechanism hierarchy
+
+Prefer the supported application workflow when it can safely perform the requested task. Use direct SQL for administrative repair, bulk correction, or operations the application cannot perform. The inherited documentation specifically notes that chemists can change an analyte one sample at a time through the Edit screen, while SQL is useful for multiple samples; QCSM unassignment is preferably performed by IHC supervisors through `QCSMUASGN.fmx`.
+
 
 ### 1.1 Transaction safety
 
@@ -56,7 +79,9 @@ WHERE owner = 'PUBLIC'
 Inspect physical table columns with:
 
 ```sql
-SELECT column_id, column_name, data_type
+SELECT column_id, column_name, data_type,
+       data_length, data_precision, data_scale,
+       nullable, data_default
 FROM all_tab_columns
 WHERE owner = UPPER('<OWNER>')
   AND table_name = UPPER('<TABLE_NAME>')
@@ -82,6 +107,25 @@ WHERE UPPER(text) LIKE UPPER('%<SEARCH_TERM>%')
 ORDER BY owner, name, type, line;
 ```
 
+Inspect constraints and their columns when diagnosing integrity errors:
+
+```sql
+SELECT owner, constraint_name, constraint_type, table_name, search_condition
+FROM all_constraints
+WHERE owner = UPPER('<OWNER>')
+  AND constraint_name = UPPER('<CONSTRAINT_NAME>');
+```
+
+```sql
+SELECT owner, constraint_name, table_name, column_name, position
+FROM all_cons_columns
+WHERE owner = UPPER('<OWNER>')
+  AND constraint_name = UPPER('<CONSTRAINT_NAME>')
+ORDER BY position;
+```
+
+`NULLABLE = 'N'` in `ALL_TAB_COLUMNS` means a value is required unless another mechanism supplies it. This is especially important before constructing an `INSERT`.
+
 Then retrieve the full source of a discovered program unit before executing it:
 
 ```sql
@@ -96,6 +140,29 @@ ORDER BY line;
 ---
 
 ## 2. LISA data model: practical mental model
+
+### 2.0 Application, privilege, and data-entry architecture
+
+**Evidence: SOURCE-DOCUMENTED.** LISA was designed for manual entry through Oracle Forms. Analysts historically have the `SELECT`, `INSERT`, and `UPDATE` privileges needed for transactional processing, while operational restrictions are enforced through LISA Forms; ordinary analyst users do not have SQL*Plus or SQL Developer access. Direct-SQL procedures in this guide assume appropriately privileged DBA/support access and are not analyst-user procedures.
+
+LISA has two documented data-entry paths:
+
+```text
+Manual entry
+    -> LISA Forms
+    -> LIMS transactional tables
+
+OIS electronic request
+    -> request XML
+    -> SOURCE_RECEIVE
+    -> LIMS_STAGE
+    -> LISA login form searches staging after the sampling-sheet key is entered
+    -> user saves the form
+    -> LIMS transactional tables
+```
+
+A record's presence in `LIMS_STAGE` therefore does **not** by itself establish that the sampling sheet has been saved into transactional LISA. This distinction is important when troubleshooting an OIS request that appears to have arrived but is not visible as a normal LISA record.
+
 
 LISA is a relational, normalized database designed around data entry. Parent/child relationships are central to maintenance work. The principal transactional hierarchy described by the documentation is approximately:
 
@@ -237,7 +304,7 @@ AND anlt_analyte_id IN (
 );
 ```
 
-A later maintenance slide gives a simplified variant: select `SMPL_ID`, select `ANALYTE_ID`, update the corresponding `ANALYSIS_TARGETS.LBST_LBST_ID`, review, and commit. Use the more restrictive form above when possible because it explicitly targets both sample and analyte.
+> **SOURCE-DEFECT — DO NOT USE WITHOUT LIVE VERIFICATION.** A later/shorter Maintenance slide shows a “simplified” assignment sequence that retrieves `SMPL_ID = 445647` and then uses `445647` as the value assigned to `ANALYSIS_TARGETS.LBST_LBST_ID`. This conflicts with the documented schema: `LBST_LBST_ID` references `LAB_SETS.LBST_ID`, not `SAMPLES.SMPL_ID`. Do not use that example as written. Obtain the actual target `LBST_ID` from an existing analysis target in the desired set, as shown above.
 
 ### 4.4 Remove analytes from an analytical set
 
@@ -303,7 +370,7 @@ DELETE l_sample_sets
 WHERE smst_id IN (<SMST_ID>);
 ```
 
-Before using this sequence, verify whether the sampling sheet contains additional samples or other dependent rows. The source provides the example but does not establish that every sampling sheet can safely be removed after deleting one lab number.
+**Mandatory blast-radius check before parent deletion:** before deleting from `SAMPLED_EMPLOYEES` or `SAMPLE_SETS`, query all remaining samples and dependent entities sharing the `SMST_ID`. Do not remove a sampling-sheet parent merely because one lab sample was deleted. The source provides the historical sequence but does not establish that every sampling sheet can safely be removed after deleting one lab number. Use `ALL_CONSTRAINTS`/`ALL_CONS_COLUMNS` when dependencies are uncertain.
 
 ---
 
@@ -413,7 +480,8 @@ WHERE lbst_lbst_id = lbst_id
   AND anlt_analyte_id = analyte_id
   AND assigned_to = 'DHALTERMAN'
   AND analyte_code = 'S777'
-  AND released_on BETWEEN '01-JAN-2019' AND '30-JUN-2024'
+  AND released_on >= DATE '2019-01-01'
+  AND released_on <  DATE '2024-07-01'
 GROUP BY analyte_code;
 ```
 
@@ -445,7 +513,9 @@ WHERE smpl_smpl_id = smpl_id
 ORDER BY 1,2;
 ```
 
-Then inspect all analysis targets for the affected lab numbers and determine which rows duplicate components that will be created from the substance. The documented example removes all other analytes in a specific set while retaining the desired analyte:
+Then inspect all analysis targets for the affected lab numbers and determine which rows duplicate components that will be created from the substance. The source's worked example used lab numbers `A12345`/`A12346`, lab set `235028`, and retained analyte `22365` (`PB-B`) while removing four other rows. The example illustrates the pattern, not a generally safe delete rule.
+
+The documented example contains this broad delete:
 
 ```sql
 DELETE l_analysis_targets
@@ -453,7 +523,7 @@ WHERE lbst_lbst_id = 235028
   AND anlt_analyte_id <> 22365;
 ```
 
-**Do not generalize that example blindly.** Identify the substance and component analytes for the actual case and delete only confirmed conflicting rows. Re-query afterward and reopen the Results form to confirm the constraint error is gone.
+**POTENTIALLY DESTRUCTIVE HISTORICAL EXAMPLE — do not generalize it.** Identify the substance and component analytes for the actual case and delete only confirmed conflicting rows. Re-query afterward and reopen the Results form to confirm the constraint error is gone.
 
 ---
 
@@ -550,7 +620,14 @@ WHERE lab_number BETWEEN <FIRST_QC> AND <LAST_QC>
 ORDER BY lab_number;
 ```
 
-### 11.5 Unpost a QC sample
+### 11.5 `LISA-QC-001` — Unpost a QC sample
+
+**Evidence:** SOURCE-DOCUMENTED + LIVE-VERIFIED 2026-09-01  
+**Preferred mechanism:** DBA SQL for the documented repair case  
+**Objects affected:** `Q_QC_SAMPLES` / `QC_DEV2.QC_SAMPLES`  
+**Precondition:** requested QC is currently `0FQ` (finished)  
+**Expected modification row count:** exactly the requested QC row(s)
+
 
 The documented mechanism for returning a finished QC to assigned status is:
 
@@ -569,7 +646,14 @@ FROM q_qc_samples
 WHERE lab_number = <QC_NUMBER>;
 ```
 
-### 11.6 Correct an ASM/theoretical value
+### 11.6 `LISA-QC-002` — Correct an ASM/theoretical value
+
+**Evidence:** SOURCE-DOCUMENTED + LIVE-VERIFIED 2026-09-01  
+**Preferred mechanism:** documented source allows SQL Developer table edit; tightly constrained DBA SQL is verified  
+**Objects affected:** `Q_SPIKED_SOLUTIONS` / `QC_DEV2.SPIKED_SOLUTIONS`  
+**Required identifiers:** QC number, `QCSMPL_ID`, `SPKSOL_ID`, `ANALYTE_ID`, expected old theoretical value  
+**Expected modification row count:** exactly one row per requested correction
+
 
 The maintenance slides state that ASM corrections—often caused by wrong extraction efficiency, density, or similar calculation input—are made in `QC_DEV2.SPIKED_SOLUTIONS`. The slides suggest filtering/editing the table in SQL Developer; SQL `UPDATE` is equally appropriate when tightly constrained.
 
@@ -606,7 +690,7 @@ WHERE spksol_id = <SPKSOL_ID>
 
 Expect one row updated. Do not commit until verified.
 
-### 11.7 Complete “unpost and update theoretical value” workflow
+### 11.7 `LISA-QC-003` — Complete “unpost and update theoretical value” workflow
 
 This workflow was verified against the live database on 2026-09-01.
 
@@ -687,7 +771,7 @@ Then update the batch:
 
 ```sql
 UPDATE q_qc_batch
-SET expiration_date = '28-DEC-2024'
+SET expiration_date = DATE '2024-12-28'
 WHERE qcbtc_id = 59856;
 ```
 
@@ -706,6 +790,31 @@ No authoritative SQL procedure for QCSM unassignment is provided in the supplied
 ---
 
 ## 12. OIS -> LISA transfer
+
+**Procedure ID:** `LISA-OIS-IN-001`  
+**Evidence:** SOURCE-DOCUMENTED; environment details are ENVIRONMENT-DEPENDENT.
+
+### 12.0 Inbound troubleshooting decision tree
+
+```text
+Analyst says OIS request is missing
+        |
+        v
+Does Request_<sampling>.xml exist in the inbound archive?
+   no --+--> investigate upstream/file transfer
+        | yes
+        v
+Does LIMS_STAGE contain the sampling number?
+   no --+--> investigate MapForce parsing/load and OIS_am.bat
+        | yes
+        v
+Has the staged record been found and saved through the LISA login form?
+   no --+--> investigate application/login-form workflow
+        | yes
+        v
+Investigate the transactional LIMS record and downstream processing
+```
+
 
 If the LISA login form has no data to populate from OIS, a transfer may not have occurred because the database server was down or a nightly MapForce job failed.
 
@@ -727,6 +836,20 @@ The maintenance slides contain inconsistent MapForce IP references (`10.150.39.1
 ---
 
 ## 13. Nightly LISA -> OIS transfers
+
+**Procedure ID:** `LISA-OIS-OUT-001`  
+**Evidence:** SOURCE-DOCUMENTED; environment details are ENVIRONMENT-DEPENDENT.
+
+Outbound conceptual flow:
+
+```text
+Released in LISA
+  -> originated from OIS / staging record exists
+  -> ois_list.par parameter row generated
+  -> response XML generated
+  -> response XML placed where OIS can pick it up
+```
+
 
 The outbound process should include samples released that day that originated from OIS with a request XML.
 
@@ -802,7 +925,7 @@ FROM l_sample_sets, l_samples, l_analysis_targets, l_lab_sets
 WHERE smst_smst_id = smst_id
   AND smpl_smpl_id = smpl_id
   AND lbst_lbst_id = lbst_id
-  AND result_posted_on > '01-JAN-1900'
+  AND result_posted_on > DATE '1900-01-01'
 --AND lab_assigned_no BETWEEN 'F23499' AND 'F23524'
 --AND sampling_number IN ('412400','413982','413983','413984')
   AND inspection_no IN ('1740661')
@@ -820,25 +943,25 @@ A new analyst needs both an Oracle user account and an entry in the LISA analyst
 
 ### 14.1 Oracle user creation example
 
-The maintenance deck contains this historical example:
+The maintenance deck contains a historical user-creation pattern. The plaintext historical password and personal example have intentionally been removed from this authoritative guide. Verify current agency identity, password, role, and profile requirements before provisioning:
 
 ```sql
 SET DEFINE OFF;
-CREATE USER SANDERSON
-  IDENTIFIED BY SEA20090826
+CREATE USER <USERNAME>
+  IDENTIFIED BY <PROVISIONED_PASSWORD>
   DEFAULT TABLESPACE USERS
   TEMPORARY TABLESPACE TEMP
   PROFILE CHEMIST_ACCOUNTS
   ACCOUNT UNLOCK;
 
-GRANT CONNECT TO SANDERSON;
-GRANT QC_USER TO SANDERSON;
-GRANT QC_USER2 TO SANDERSON;
-GRANT ANALYST2 TO SANDERSON;
-ALTER USER SANDERSON DEFAULT ROLE ALL;
+GRANT CONNECT TO <USERNAME>;
+GRANT QC_USER TO <USERNAME>;
+GRANT QC_USER2 TO <USERNAME>;
+GRANT ANALYST2 TO <USERNAME>;
+ALTER USER <USERNAME> DEFAULT ROLE ALL;
 ```
 
-**Security note:** the example includes a literal historical password. Do not reuse it or copy this password practice. Use the organization's current credential provisioning and password policy. Verify that the listed roles/profile remain current before granting them.
+**Security note:** the roles/profile above are historical source material, not guaranteed current configuration. Use the organization's current credential provisioning and password policy and verify every role/profile before granting it.
 
 ### 14.2 Add the analyst to LISA
 
@@ -852,11 +975,11 @@ INSERT INTO LIMS.ANALYSTS
     E_MAIL, EXTENSION, ANA_INITIALS_ID, INITIALS_ID, STATUS,
     LOGON_ID, END_DATE, BEGIN_DATE)
 VALUES
-   (l_ana_seq.nextval, 'GS-9', 'CHEMIST - ANALYST', 'EBAID', 'Bassem',
+   (l_ana_seq.nextval, '<PAY_GRADE>', 'CHEMIST - ANALYST', '<LAST_NAME>', '<FIRST_NAME>',
     9, NULL, NULL,
     TO_DATE('05/23/2022 00:00:00', 'MM/DD/YYYY HH24:MI:SS'),
-    'CHEMISTRY', 'EBAID.BASSEM.S@DOL.GOV', NULL,
-    'BJA', 'BSE', NULL, 'SEBAID', NULL, NULL);
+    'CHEMISTRY', '<EMAIL>', NULL,
+    '<SUPERVISOR_INITIALS>', '<UNIQUE_INITIALS>', NULL, '<LOGON_ID>', NULL, NULL);
 
 COMMIT;
 ```
@@ -920,9 +1043,11 @@ A procedure name is not sufficient evidence of its side effects. Check source fo
 
 The supplied documentation does **not** fully document every DBA operation. Important known gaps include:
 
-- No complete QC ERD/DSD was supplied. The QC relationships in this guide were discovered from live metadata and data.
+- The Maintenance material contains a limited QC entity diagram, but not a complete current physical QC DSD comparable to DSD12. The QC relationships and column structures used operationally in this guide were therefore confirmed from live metadata/data on 2026-09-01.
 - No application-level instructions were supplied for reposting/re-finishing a QC after DBA correction. `UPDATE_PRECS2` reveals database behavior but should not be treated as a substitute for the normal application workflow.
 - The documentation says theoretical/ASM values can be edited in `SPIKED_SOLUTIONS` but does not name `THEORETICAL`; that column was verified live.
+- ERD5 contains a legacy `SAMPLES.FLOW_CC` attribute that is not present in the later DSD12 physical `SAMPLES` structure. Treat `FLOW_CC` as historical/legacy unless live metadata proves otherwise.
+- The shorter outbound-OIS slide says `lims.sample_sets`, while the longer slide and the actual later query use `lims_stage.sample_sets`; treat the shorter reference as an apparent source typo unless live verification shows otherwise.
 - The documentation does not describe `FOUND_THEOR_RATIO` behavior after an ASM correction; this was established by live observation and stored-source inspection.
 - The two maintenance presentations differ in some details and length. One includes additional material such as changing sampling-sheet primary-key information, analyst counting, and user creation.
 - MapForce server IP/path references are inconsistent across the supplied slides. Verify current environment values before operational use.
@@ -951,24 +1076,26 @@ When this guide is used by an LLM assisting a DBA, follow these rules:
 
 ## 18. Quick-reference task index
 
+Stable procedure identifiers should be used in tickets/change logs where applicable.
+
 | Task | Primary objects / mechanism |
 |---|---|
-| Find a sample | `L_SAMPLES`, `L_SAMPLE_SETS` |
-| Inspect analytical assignment | `L_ANALYSIS_TARGETS`, `L_LAB_SETS`, `L_ANALYTES` |
-| Assign sample/analyte to set | update `L_ANALYSIS_TARGETS.LBST_LBST_ID` |
-| Unassign sample/analyte | set `LBST_LBST_ID = 0` |
-| Delete sample | delete children, then `L_SAMPLES`, then parent rows when appropriate |
+| `LISA-SAMPLE-001` Find a sample | `L_SAMPLES`, `L_SAMPLE_SETS` |
+| `LISA-ASSIGN-001` Inspect analytical assignment | `L_ANALYSIS_TARGETS`, `L_LAB_SETS`, `L_ANALYTES` |
+| `LISA-ASSIGN-002` Assign sample/analyte to set | update `L_ANALYSIS_TARGETS.LBST_LBST_ID` |
+| `LISA-ASSIGN-003` Unassign sample/analyte | set `LBST_LBST_ID = 0` |
+| `LISA-DELETE-001` Delete sample | delete children, then `L_SAMPLES`, then parent rows when appropriate |
 | Change analyte | update `L_ANALYSIS_TARGETS.ANLT_ANALYTE_ID` |
 | Add missing analyte | insert `L_ANALYSIS_TARGETS` row |
 | Change office/inspection/sampling number | update `L_SAMPLE_SETS` by `SMST_ID` |
 | Count analyst work | aggregate `L_ANALYSIS_TARGETS` + `L_LAB_SETS` |
 | Resolve substance unique constraint | inspect component analytes; remove confirmed duplicate targets |
-| QC unpost | `Q_QC_SAMPLES.SAMPLE_STATUS: 0FQ -> 0AQ` |
-| QC ASM/theoretical correction | `Q_SPIKED_SOLUTIONS.THEORETICAL` |
+| `LISA-QC-001` QC unpost | `Q_QC_SAMPLES.SAMPLE_STATUS: 0FQ -> 0AQ` |
+| `LISA-QC-002` QC ASM/theoretical correction | `Q_SPIKED_SOLUTIONS.THEORETICAL` |
 | QC batch expiration | `Q_QC_BATCH.EXPIRATION_DATE` |
 | QCSM unassignment | `QCSMUASGN.fmx` (preferred documented method) |
-| Inbound OIS troubleshooting | staging tables, MapForce inbound job |
-| Outbound OIS troubleshooting | `lisarpt.OIS_XML_RELEASE`, `ois_list.par`, response batch file |
+| `LISA-OIS-IN-001` Inbound OIS troubleshooting | staging tables, MapForce inbound job |
+| `LISA-OIS-OUT-001` Outbound OIS troubleshooting | `lisarpt.OIS_XML_RELEASE`, `ois_list.par`, response batch file |
 | Add analyst | Oracle account + `LIMS.ANALYSTS` row |
 | Discover unknown object | `ALL_OBJECTS`, `ALL_SYNONYMS`, `ALL_TAB_COLUMNS`, `ALL_SOURCE` |
 
@@ -1014,3 +1141,134 @@ Keep this document under version control. For every newly discovered DBA procedu
 - whether the procedure is **source-documented**, **live-verified**, or both.
 
 That practice turns future one-off troubleshooting into durable LISA operational knowledge while keeping observed facts separate from assumptions.
+
+
+## 21. Compact LIMS data dictionary and relationship reference
+
+**Evidence:** primarily DSD12 physical schema; ERD5 is used for historical/conceptual semantics. Current live metadata wins if it differs. This appendix intentionally converts the dense diagrams into searchable text.
+
+| Object | Primary identifier / key | Important relationships / columns | Operational purpose |
+|---|---|---|---|
+| `SAMPLE_SETS` | `SMST_ID` | office, inspection, sampling number, dates, CSHO, SIC, processing expedience | Sampling-sheet/header record |
+| `SAMPLES` | `SMPL_ID` | `SMST_SMST_ID`, sample type, media, `LAB_ASSIGNED_NO`, `SUBMISSION_NO`, blank, flow, weight | Physical laboratory sample |
+| `TIME_CHECKS` | `TMCK_ID` | `SMPL_SMPL_ID`, `TIME_ON`, `TIME_OFF` | Sample timing child rows |
+| `SAMPLED_EMPLOYEES` | `EMP_ID` | `SMST_SMST_ID`, occupation | Employee sampled on sampling sheet |
+| `ANALYSIS_TARGETS` | `ANLY_ID` | sample, analyte, method, instrument, lab set, qualifier, UOM; result A/B, detection limit, solution volume | Requested/result analyte row |
+| `LAB_SETS` | `LBST_ID` | assigned analyst, method, instrument; assigned/posted/checked/released dates/users | Analytical work-set workflow |
+| `ANALYTES` | `ANALYTE_ID` | `ANALYTE_CODE`, description, sampling rate, conversion factor, station | Analyte master |
+| `ANALYTICAL_METHODS` | `ANMT_ID` | description | Analytical method master |
+| `METHOD_ANALYTE` | `MTAN_ID` | analyte + method | Valid/associated analyte-method mapping |
+| `INSTRUMENTS` | `INST_ID` | barcode, name, station | Instrument master |
+| `COLLECTION_MEDIA` | `MEDIA_ID` / physical schema identifier | description, short description, used flag | Collection media master |
+| `COLLECTION_MEDIA_SYNONYMS` | `CMSN_ID` | media synonym -> collection media | Alternate media naming |
+| `MEDIA_ANALYTES` | `MDAN_ID` | collection media, analyte, supplier | Media/analyte compatibility/mapping |
+| `MEDIA_SUPPLIERS` | `MDSP_ID` | supplier contact fields | Media supplier master |
+| `SUBSTANCES` | `SUBS_ID` | substance analyte -> component analyte | Composite/substance decomposition |
+| `UNITS_OF_MEASURE` | `ABBREVIATION` | description | Result/unit master |
+| `QUALIFIER` | `TYPE` | description | Result qualifier master |
+| `COMMENTS` | `CMMT_ID` | comment text/type/number | Reusable comments |
+| `SET_COMMENTS` | `STCT_ID` | comment + lab set | Comments attached to analytical sets |
+| `SMPL_COMMENTS` | `SMCT_ID` | analysis target + comment | Comments attached to sample/analysis work |
+| `FIELD_OFFICES` | `OFFICE_ID` | region, scope, status, contact fields | OSHA office master |
+| `COMPLIANCE_OFFICERS` | `CSHO_ID` | office, name/contact, begin/end dates | CSHO master |
+| `OCCUPATIONS` | `JOB_CODE` | description | Occupation master |
+| `PROTECTIVE_EQUIPMENTS` | `DEVICE_CODE` | description | PPE master |
+| `TYPE_OF_PROTECTIONS` | `TYPR_ID` | employee + protective equipment | Employee/PPE relationship |
+| `STATIONS` | `STTN_NUMBER` | name/comment | Laboratory station master |
+| `STATION_ANALYTE` | `STAN_ID` | station + analyte | Station/analyte mapping |
+| `ASSIGNMENTS` | `ASGN_ID` | month/year, analyst, station | Analyst/station assignment |
+| `APPLICABLE_CALCULATIONS` | `APCL_ID` | analyte, exposure limit, UOM, value, posted date | Exposure/calculation support |
+| `EXPOSURE_LIMITS` | `EXPL_ID` | short/long descriptions | Exposure limit master |
+| `HISTORICAL_SAE` | `HSAE_ID` | analyte, method, media, instrument, date/value | Historical SAE values |
+| `SIC_CODES` | `SIC_ID` | SIC code/description | Industry classification |
+| `REGIONS` | `RGN_NUMBER` | name/phone | OSHA region master |
+| `REGION_PERSONNEL` | `REGION_PERS_ID` | region, name, extension/title | Regional personnel |
+| `PROCESSING_EXPEDIANCES` | `PROC_ID` | description | Processing expedience/priority support |
+| `EXPOSURE_SUMMARY` | derived/reporting object | office, inspection, sampling, analyte, unit, exposure levels, release/severity fields | Exposure reporting/summary |
+| `ASSIGNA` | view/reporting object | sample, inspection, analyst/analyte/station/media/priority fields | Assignment-oriented query/view |
+
+### 21.1 Critical physical constraint families
+
+DSD12 documents primary, unique, check, and foreign-key constraints. Examples include `ANLY_PK`, `ANLY_UK`, `ANLY_CK` for `ANALYSIS_TARGETS`, plus foreign keys to sample, analyte, method, instrument, lab set, qualifier, and UOM. `SAMPLES` similarly has `SMPL_PK`, `SMPL_UK`, `SAMPLES_CK`, and its foreign keys. When Oracle reports a named constraint, query `ALL_CONSTRAINTS` and `ALL_CONS_COLUMNS` rather than guessing its meaning.
+
+### 21.2 LAB_SETS workflow fields
+
+The supplied physical documentation shows workflow fields including `LBST_ID`, `ASSIGNED_TO`, `DATE_ASSIGNED`, `OPEN_COMMENT`, `ANMT_ANMT_ID`, `INST_INST_ID`, `RELEASED_BY`, `RELEASED_ON`, `RESULT_POSTED_BY`, `RESULT_POSTED_ON`, `CHECKED_BY`, `CHECKED_ON`, `CHECKERS_HOURS`, and `LOAD_COMMENTS`. Historical diagrams/screenshots may show additional legacy fields; use live `ALL_TAB_COLUMNS` for authoritative current nullability and column existence before writing DML.
+
+---
+
+## 22. Known Oracle errors and source defects
+
+| Signature / issue | Meaning / action |
+|---|---|
+| `ORA-00001` on the analysis-target unique constraint during substance conversion | Match the situation to Section 10 before deleting anything; inspect actual constraint metadata and component analytes first. The inherited source associates this failure with `LIMS.CHANGE_SUBSTANCE_TO_IMIS`. |
+| Short-deck assignment example uses a returned `SMPL_ID` as `LBST_LBST_ID` | **SOURCE-DEFECT. Do not use as written.** `LBST_LBST_ID` must reference a lab-set ID. |
+| `FLOW_CC` appears in ERD5 but not DSD12 physical `SAMPLES` | Historical schema discrepancy; verify live metadata. |
+| `lims.sample_sets` vs `lims_stage.sample_sets` in OIS slides | Apparent source inconsistency; later query and longer source use `LIMS_STAGE.SAMPLE_SETS`. Verify live environment. |
+| MapForce IP/path variants | ENVIRONMENT-DEPENDENT; verify current server/path. |
+
+---
+
+## 23. Glossary
+
+| Term | Meaning supported by source/context |
+|---|---|
+| **LISA / LIMS** | Laboratory Information System / database naming used by the OSHA laboratory application and schema artifacts. The inherited materials use both terms. |
+| **OIS** | OSHA Information System; source/destination for electronic request/response integration in these materials. |
+| **CSHO** | Compliance Safety and Health Officer; represented in the compliance-officer and sampling data. |
+| **TWA** | Time-weighted average; `EIGHT_HR_TWA` appears on sampling-sheet data. |
+| **QCSM** | QC sample terminology used by the maintenance material; QCSM unassignment is associated with `QCSMUASGN.fmx`. |
+| **ASM** | Term used by the Maintenance slides for values corrected in `SPIKED_SOLUTIONS`; the source does not expand the acronym. Do not invent an expansion. |
+| **SAE** | Term used in `HISTORICAL_SAE` and QC calculations; the supplied sources do not provide an authoritative expansion. |
+| **IMIS** | Historical OSHA/legacy terminology used as an analyte-code alias and in `CHANGE_SUBSTANCE_TO_IMIS`; the supplied sources do not define the acronym, so this guide does not assert an expansion. |
+| **91A** | Sampling-sheet/form terminology used by the Maintenance documentation; `SAMPLE_SETS` corresponds to its top section. |
+| **MapForce** | Integration tooling/server used to parse OIS XML and generate response XML. |
+
+---
+
+## 24. Environment-dependent configuration and operations
+
+These values are useful clues but **must be verified before operational use**.
+
+| Item | Historical/source value | Verification note |
+|---|---|---|
+| Inbound job | `D:/lims/shells/OIS_am.bat` | Verify current server and path |
+| MapForce project | `D:\mapforce\v19\labRequests\labRequest1_9_stage_p.mfd` | Verify version/path |
+| MapForce server | conflicting `10.150.39.15` / `10.158.39.15` | Do not assume either is current |
+| Inbound archive | `D:/ois_xchng/receive/OIS/archive` | Verify current path |
+| Outbound parameter generation | about 9:30 PM; `lisarpt.OIS_XML_RELEASE` | Verify current schedule/job |
+| Response parameter directory | both `response/OIS/param` and `responses/OIS/param` appear | Verify actual path |
+| Response batch | `D:/lims/shells/new_ois_run_lab_response_no_gen_list.bat` | Verify current path |
+| Maintenance window | source notes Friday evening around 21:00 Eastern can disrupt transfers | Historical operational note; verify current maintenance schedule |
+| Success email recipients | inbound/outbound jobs historically send success email; recipient configuration is maintained in batch files | Personnel names in historical slides intentionally omitted; inspect current batch/configuration |
+| Oracle roles/profile | `CONNECT`, `QC_USER`, `QC_USER2`, `ANALYST2`, `CHEMIST_ACCOUNTS` | Historical; verify current security policy |
+
+---
+
+## 25. Standard procedure template for future additions
+
+Every new procedure added to this guide should use this structure:
+
+```text
+PROCEDURE ID / TASK
+Purpose
+When to use
+Do not use when
+Preferred mechanism (LISA Form / QC Form / DBA SQL / infrastructure)
+Required identifiers
+Objects affected
+Evidence / status
+Pre-change SELECT
+Expected preconditions
+Modification SQL or application steps
+Expected row count
+Verification SELECT
+Commit point
+Rollback / recovery
+Known side effects
+Related application form/job/procedure
+Known source discrepancies
+Date live-verified (if applicable)
+```
+
+For new SQL authored by this guide, prefer explicit `JOIN ... ON` syntax and ANSI date literals (`DATE 'YYYY-MM-DD'`) where practical. Historical SQL may be retained for provenance but should be labeled as historical when it uses older conventions.
