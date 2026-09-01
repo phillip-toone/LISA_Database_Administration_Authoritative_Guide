@@ -1,7 +1,5 @@
 # LISA Database Administration Authoritative Guide
 
-**Version:** 0.9 Review Consolidation — 2026-09-01  
-
 **System:** OSHA Laboratory Information System (LISA / LIMS)  
 **Primary database areas covered:** LIMS transactional schema, QC (`QC_DEV2`), OIS staging/transfer support, analyst/user administration  
 **Purpose:** Stand-alone operational reference for a human DBA or an LLM assisting a DBA.  
@@ -620,16 +618,41 @@ WHERE lab_number BETWEEN <FIRST_QC> AND <LAST_QC>
 ORDER BY lab_number;
 ```
 
-### 11.5 `LISA-QC-001` — Unpost a QC sample
+### 11.5 `LISA-QC-001` — Unpost a finished QC set/sample
 
-**Evidence:** SOURCE-DOCUMENTED + LIVE-VERIFIED 2026-09-01  
-**Preferred mechanism:** DBA SQL for the documented repair case  
-**Objects affected:** `Q_QC_SAMPLES` / `QC_DEV2.QC_SAMPLES`  
-**Precondition:** requested QC is currently `0FQ` (finished)  
-**Expected modification row count:** exactly the requested QC row(s)
+**Evidence:** sample-status transition is SOURCE-DOCUMENTED + LIVE-VERIFIED 2026-09-01; set-level `RESULTS_DT` reset is LIVE-VERIFIED 2026-09-01 from the QC 521028–521031 incident and is not stated in the inherited Maintenance slides.  
+**Preferred mechanism:** DBA SQL for the verified repair case  
+**Objects affected:** `Q_QC_SAMPLES` / `QC_DEV2.QC_SAMPLES` and `Q_SETS` / `QC_DEV2.SETS`  
+**Precondition:** requested QC is currently `0FQ` (finished), its parent `SET_ID` has been verified, and the operator has inspected all QC samples in that set.
 
+A finished QC has both sample-level and set-level workflow state. Live inspection of `QC_DEV2.UPDATE_PRECS2` established that finishing a QC set sets `Q_SETS.RESULTS_DT = SYSDATE` and sets all `QC_SAMPLES` in the set to `SAMPLE_STATUS = '0FQ'`. Live verification on 2026-09-01 established that, for the previously finished set investigated, changing only `QC_SAMPLES.SAMPLE_STATUS` was insufficient to restore application visibility. Subsequent investigation identified the retained completion timestamp in `SETS.RESULTS_DT` as an inconsistent set-level state, and it was reset to the active/uncompleted sentinel. Accordingly, the verified unpost procedure treats sample-level and set-level state together. This is a live-verified workflow for the investigated whole-set case, not proof that every possible QC unpost under every workflow condition has identical requirements.
 
-The documented mechanism for returning a finished QC to assigned status is:
+First identify the target QC rows and parent set, and inspect every sample in that set:
+
+```sql
+SELECT lab_number, qcsmpl_id, set_set_id, sample_status, blank
+FROM q_qc_samples
+WHERE lab_number BETWEEN <FIRST_QC> AND <LAST_QC>
+ORDER BY lab_number;
+
+SELECT lab_number, sample_status, blank
+FROM q_qc_samples
+WHERE set_set_id = <SET_ID>
+ORDER BY lab_number;
+```
+
+Inspect the exact set-level results timestamp before changing it:
+
+```sql
+SELECT set_id,
+       results_dt,
+       TO_CHAR(results_dt, 'YYYY-MM-DD HH24:MI:SS') AS results_dt_exact,
+       ana_analyst_id_asgto
+FROM q_sets
+WHERE set_id = <SET_ID>;
+```
+
+The sample-level transition is:
 
 ```sql
 UPDATE q_qc_samples
@@ -638,13 +661,40 @@ WHERE lab_number = <QC_NUMBER>
   AND sample_status = '0FQ';
 ```
 
-Use the old-status predicate so an unexpected state produces zero updated rows rather than silently overwriting it. Verify afterward:
+Use the old-status predicate so an unexpected state produces zero updated rows rather than silently overwriting it. Expect exactly one row for each requested QC.
+
+For a set being returned from the finished state, reset the parent set's `RESULTS_DT` to the active/uncompleted sentinel. On 2026-09-01, live comparison against an active `0AQ` set established the sentinel as exactly `1900-01-01 00:00:00`. This value is LIVE-VERIFIED, not source-documented; if the environment has changed or contrary evidence exists, verify the sentinel against a current active `0AQ` set before use. Use the exact old timestamp as a guard:
 
 ```sql
-SELECT lab_number, sample_status
-FROM q_qc_samples
-WHERE lab_number = <QC_NUMBER>;
+UPDATE q_sets
+SET results_dt = DATE '1900-01-01'
+WHERE set_id = <SET_ID>
+  AND results_dt = TO_DATE(
+        '<EXPECTED_OLD_RESULTS_TIMESTAMP>',
+        'YYYY-MM-DD HH24:MI:SS'
+      );
 ```
+
+Expect exactly one row. If zero rows are updated, stop and re-query the exact timestamp; Oracle `DATE` values may contain a time component even when SQL Developer displays only the date. Do not weaken the guard merely to force a match.
+
+Verify both levels before committing:
+
+```sql
+SELECT s.set_id,
+       TO_CHAR(s.results_dt, 'YYYY-MM-DD HH24:MI:SS') AS results_dt,
+       s.ana_analyst_id_asgto,
+       q.lab_number,
+       q.sample_status
+FROM q_sets s
+JOIN q_qc_samples q
+  ON q.set_set_id = s.set_id
+WHERE s.set_id = <SET_ID>
+ORDER BY q.lab_number;
+```
+
+For the verified workflow, the intended unposted state is `QC_SAMPLES.SAMPLE_STATUS = '0AQ'` for the requested samples and `SETS.RESULTS_DT = DATE '1900-01-01'` for the parent set. Because `RESULTS_DT` is set-level state, do not reset it until the complete membership and requested scope of the set have been inspected.
+
+> **Scope limitation — partial-set unpost not yet verified.** The 2026-09-01 live verification involved unposting every QC sample in set 27514. The correct set-level behavior when only a subset of samples in a previously finished QC set is to be unposted has not been established. If a request targets fewer than all members of a set, perform the read-only discovery steps, but do not reset `SETS.RESULTS_DT` based solely on this procedure. Investigate the application workflow and/or stored code first and document the verified behavior.
 
 ### 11.6 `LISA-QC-002` — Correct an ASM/theoretical value
 
@@ -690,49 +740,52 @@ WHERE spksol_id = <SPKSOL_ID>
 
 Expect one row updated. Do not commit until verified.
 
-### 11.7 `LISA-QC-003` — Complete “unpost and update theoretical value” workflow
+### 11.7 `LISA-QC-003` — Complete whole-set “unpost and update theoretical value” workflow
 
-This workflow was verified against the live database on 2026-09-01.
+This workflow was verified against the live database on 2026-09-01, including the set-level correction discovered after the initial sample-status-only unpost did not make the QCs visible to the assigned analyst.
 
 1. Query the requested QC numbers and confirm they are `0FQ`.
 2. Determine their `QCSMPL_ID`, `SET_SET_ID`, blank status, and corresponding `SPIKED_SOLUTIONS` rows.
-3. Confirm the existing `THEORETICAL` value exactly matches the requester's stated old value.
-4. Change `QC_SAMPLES.SAMPLE_STATUS` from `0FQ` to `0AQ` for each requested QC.
-5. For QCs requiring value correction, update only `SPIKED_SOLUTIONS.THEORETICAL` using the exact row IDs and old value in the `WHERE` clause.
-6. For an “unpost only” QC, do not change its theoretical value.
-7. Run a consolidated verification query.
-8. Check whether the set contains additional QC samples before making assumptions about set-level processing.
-9. Do **not** manually update `FOUND_THEOR_RATIO` merely because `THEORETICAL` changed; see the next section.
-10. Commit only after all requested rows match the intended state.
+3. Inspect **all** QC samples in each affected set before changing set-level state.
+4. Inspect and record the exact current `Q_SETS.RESULTS_DT`, including its time component.
+5. Confirm each existing `THEORETICAL` value exactly matches the requester's stated old value.
+6. Change `QC_SAMPLES.SAMPLE_STATUS` from `0FQ` to `0AQ` for each requested QC, using the expected old status as a guard.
+7. For QCs requiring value correction, update only `SPIKED_SOLUTIONS.THEORETICAL` using exact row IDs and the expected old value in the `WHERE` clause.
+8. For an “unpost only” QC, do not change its theoretical value.
+9. **For the live-verified whole-set case,** reset the affected parent set's `Q_SETS.RESULTS_DT` from its verified completion timestamp to the live-verified active sentinel `DATE '1900-01-01'`, using the exact old timestamp in the `WHERE` clause. If the current environment gives contrary evidence, verify the sentinel against a current active `0AQ` set before use. **If fewer than all members of the set are being unposted, do not perform this step based solely on this procedure; see the partial-set scope limitation in `LISA-QC-001`.**
+10. Run a consolidated verification query that includes both set-level `RESULTS_DT` and sample-level status/value state.
+11. Do **not** manually update `FOUND_THEOR_RATIO` merely because `THEORETICAL` changed; see the next section.
+12. Commit only after all requested rows and the parent set match the intended state.
+13. For an important repair, run the same verification after `COMMIT` and have the requester confirm application visibility before making further changes.
+
+**Expected application result:** After commit, the assigned analyst can again locate/open the unposted QC set through the normal QC workflow. Treat success at three distinct levels: (1) SQL success — expected row counts; (2) database-state success — `0AQ`, active `RESULTS_DT` sentinel, and requested `THEORETICAL` values; and (3) application/workflow success — analyst confirmation that the QCs are visible and processable. Do not equate a successful SQL row count with end-to-end resolution.
 
 Consolidated verification query:
 
 ```sql
-SELECT q.lab_number,
+SELECT s.set_id,
+       TO_CHAR(s.results_dt, 'YYYY-MM-DD HH24:MI:SS') AS results_dt,
+       s.ana_analyst_id_asgto,
+       q.lab_number,
        q.sample_status,
        q.blank,
-       s.spksol_id,
-       s.anlt_analyte_id,
-       s.theoretical,
-       s.found,
-       s.found_theor_ratio,
-       s.in_control,
-       s.included
-FROM q_qc_samples q
-JOIN q_spiked_solutions s
-  ON s.qcsmpl_qcsmpl_id = q.qcsmpl_id
-WHERE q.lab_number BETWEEN <FIRST_QC> AND <LAST_QC>
-ORDER BY q.lab_number;
+       sp.spksol_id,
+       sp.anlt_analyte_id,
+       sp.theoretical,
+       sp.found,
+       sp.found_theor_ratio,
+       sp.in_control,
+       sp.included
+FROM q_sets s
+JOIN q_qc_samples q
+  ON q.set_set_id = s.set_id
+LEFT JOIN q_spiked_solutions sp
+  ON sp.qcsmpl_qcsmpl_id = q.qcsmpl_id
+WHERE s.set_id = <SET_ID>
+ORDER BY q.lab_number, sp.anlt_analyte_id;
 ```
 
-Check all samples in the QC set:
-
-```sql
-SELECT lab_number, sample_status, blank
-FROM q_qc_samples
-WHERE set_set_id = <SET_ID>
-ORDER BY lab_number;
-```
+**2026-09-01 lesson learned:** changing only `QC_SAMPLES.SAMPLE_STATUS` from `0FQ` to `0AQ` was insufficient for QC 521028–521031. It left set 27514 with `RESULTS_DT = 2026-08-28 12:35:20`, producing a mixed state, and the assigned analyst reported that the QCs were not visible. Resetting `SETS.RESULTS_DT` to the verified active sentinel brought the database-side state into alignment with the active `0AQ` state observed in the comparison set. Application visibility should be confirmed by the assigned analyst after commit before treating the repair as end-to-end verified.
 
 ### 11.8 `FOUND_THEOR_RATIO` and `UPDATE_PRECS2`
 
@@ -1090,7 +1143,7 @@ Stable procedure identifiers should be used in tickets/change logs where applica
 | Change office/inspection/sampling number | update `L_SAMPLE_SETS` by `SMST_ID` |
 | Count analyst work | aggregate `L_ANALYSIS_TARGETS` + `L_LAB_SETS` |
 | Resolve substance unique constraint | inspect component analytes; remove confirmed duplicate targets |
-| `LISA-QC-001` QC unpost | `Q_QC_SAMPLES.SAMPLE_STATUS: 0FQ -> 0AQ` |
+| `LISA-QC-001` QC unpost | set-aware whole-set workflow: `Q_QC_SAMPLES.SAMPLE_STATUS: 0FQ -> 0AQ` plus `Q_SETS.RESULTS_DT` reset to the **live-verified** active sentinel after whole-set inspection; partial-set behavior is not yet verified |
 | `LISA-QC-002` QC ASM/theoretical correction | `Q_SPIKED_SOLUTIONS.THEORETICAL` |
 | QC batch expiration | `Q_QC_BATCH.EXPIRATION_DATE` |
 | QCSM unassignment | `QCSMUASGN.fmx` (preferred documented method) |
@@ -1117,10 +1170,13 @@ This guide consolidates the following supplied materials:
 - `Q_QC_SAMPLES -> QC_DEV2.QC_SAMPLES`
 - `Q_SPIKED_SOLUTIONS -> QC_DEV2.SPIKED_SOLUTIONS`
 - `QC_SAMPLES.QCSMPL_ID -> SPIKED_SOLUTIONS.QCSMPL_QCSMPL_ID`
-- `0FQ -> 0AQ` performs the documented QC unpost/return-to-assigned state.
+- `0FQ -> 0AQ` is the sample-level portion of QC unpost/return-to-assigned state. Live verification on 2026-09-01 established that changing sample status alone left the previously finished set in a mixed state and did not restore application visibility. Subsequent investigation identified the retained `Q_SETS.RESULTS_DT` completion timestamp as inconsistent with the active `0AQ` comparison state, and it was reset to the live-verified sentinel `1900-01-01 00:00:00`. End-to-end necessity remains subject to application confirmation by the assigned analyst.
 - ASM correction is a change to `SPIKED_SOLUTIONS.THEORETICAL`.
 - Direct theoretical-value updates do not automatically refresh `FOUND_THEOR_RATIO` through a table trigger.
 - `UPDATE_PRECS2` recalculates `FOUND_THEOR_RATIO`, marks the entire set `0FQ`, updates `RESULTS_DT`, recalculates precision, and commits internally; it is therefore not an appropriate helper for an unpost-only/correction transaction.
+- QC unpost is set-aware in the live-verified 2026-09-01 whole-set case: inspect all set members, change requested finished samples to `0AQ`, and reset the previously finished set's `SETS.RESULTS_DT` to the live-verified active sentinel using a guarded update. Partial-set unpost behavior has not yet been verified and must not be inferred from this case.
+- End-to-end application visibility after the `RESULTS_DT` correction was not established within the documented session unless separately confirmed by the assigned analyst. Until such confirmation is recorded, distinguish database-state verification from application/workflow verification.
+- Oracle `DATE` values can contain a time component even when SQL Developer displays only the date; retrieve `TO_CHAR(..., 'YYYY-MM-DD HH24:MI:SS')` before constructing an exact old-value guard.
 
 ---
 
