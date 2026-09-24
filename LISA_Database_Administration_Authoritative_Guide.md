@@ -337,42 +337,206 @@ The documentation notes that a sample cannot be truly unassigned from an analyst
 
 ---
 
-## 5. Deleting a sample
+## 5. `LISA-DELETE-001` — Delete accidentally logged LISA samples
 
-Because `SAMPLES` has child rows (notably `ANALYSIS_TARGETS` and `TIME_CHECKS`), delete children before parents.
+**Purpose:** Permanently remove one or more LISA samples that were logged in error, while preserving parent/child integrity and avoiding deletion of sampling-sheet records that remain in use.
 
-Example sequence from the maintenance documentation:
+**When to use:** An authorized requester has identified specific LISA lab numbers that should not exist in LISA, and direct DBA deletion is appropriate.
+
+**Do not use when:** The target lab numbers, `SMPL_ID` values, or sampling-sheet membership have not been verified; other samples sharing the same `SMST_ID` have not been inspected; or dependencies are uncertain and have not been discovered.
+
+**Preferred mechanism:** DBA SQL for an authorized administrative deletion.
+
+**Required identifiers:** Requested lab number(s), verified `SMPL_ID` value(s), and verified parent `SMST_ID` value(s).
+
+**Objects affected:** `L_ANALYSIS_TARGETS`, `L_TIME_CHECKS`, `L_SAMPLES`; and, only when the complete sampling sheet is confirmed to be in scope and no samples remain, `L_SAMPLED_EMPLOYEES` and `L_SAMPLE_SETS`.
+
+**Evidence / status:** SOURCE-DOCUMENTED + LIVE-VERIFIED 2026-09-24. The inherited maintenance documentation establishes the child-before-parent deletion sequence. The 2026-09-24 live case verified the complete workflow, including sampling-sheet blast-radius inspection, expected row-count checks, pre-commit verification, commit, and post-commit verification.
+
+### 5.1 Identify the requested samples and parent sampling sheet
+
+Start with a read-only lookup. Record the returned `SMPL_ID` and `SMST_SMST_ID` values before modifying anything.
 
 ```sql
-DELETE l_analysis_targets
-WHERE smpl_smpl_id IN (
-    SELECT smpl_id FROM l_samples
-    WHERE lab_assigned_no BETWEEN '156484' AND '156484'
-);
-
-DELETE l_time_checks
-WHERE smpl_smpl_id IN (
-    SELECT smpl_id FROM l_samples
-    WHERE lab_assigned_no BETWEEN '156484' AND '156484'
-);
-
-SELECT smst_smst_id
-FROM l_samples
-WHERE lab_assigned_no BETWEEN '156484' AND '156484';
-
--- Save the returned SMST_ID before continuing.
-
-DELETE l_samples
-WHERE lab_assigned_no BETWEEN '156484' AND '156484';
-
-DELETE l_sampled_employees
-WHERE smst_smst_id IN (<SMST_ID>);
-
-DELETE l_sample_sets
-WHERE smst_id IN (<SMST_ID>);
+SELECT lab_assigned_no,
+       smpl_id,
+       smst_smst_id,
+       inspection_no,
+       sampling_number,
+       flof_office_id,
+       submission_no,
+       sampled_establishment,
+       recvd_in_lab,
+       sampling_date,
+       shipping_date
+FROM l_samples, l_sample_sets
+WHERE smst_id = smst_smst_id
+  AND lab_assigned_no BETWEEN '<FIRST_LAB_NO>' AND '<LAST_LAB_NO>'
+ORDER BY lab_assigned_no;
 ```
 
-**Mandatory blast-radius check before parent deletion:** before deleting from `SAMPLED_EMPLOYEES` or `SAMPLE_SETS`, query all remaining samples and dependent entities sharing the `SMST_ID`. Do not remove a sampling-sheet parent merely because one lab sample was deleted. The source provides the historical sequence but does not establish that every sampling sheet can safely be removed after deleting one lab number. Use `ALL_CONSTRAINTS`/`ALL_CONS_COLUMNS` when dependencies are uncertain.
+Confirm that every returned row is in scope. Do not infer identifiers from lab-number sequence alone.
+
+### 5.2 Mandatory sampling-sheet blast-radius inspection
+
+Before deleting anything, inspect **all** samples sharing each target `SMST_ID`, not merely the requested lab-number range. This establishes whether the requested samples constitute the complete sampling sheet.
+
+```sql
+SELECT s.lab_assigned_no,
+       s.smpl_id,
+       s.smst_smst_id,
+       s.submission_no,
+       COUNT(DISTINCT a.anly_id) AS analysis_targets,
+       COUNT(DISTINCT t.tmck_id) AS time_checks
+FROM l_samples s
+LEFT JOIN l_analysis_targets a
+       ON a.smpl_smpl_id = s.smpl_id
+LEFT JOIN l_time_checks t
+       ON t.smpl_smpl_id = s.smpl_id
+WHERE s.smst_smst_id = <SMST_ID>
+GROUP BY s.lab_assigned_no,
+         s.smpl_id,
+         s.smst_smst_id,
+         s.submission_no
+ORDER BY s.lab_assigned_no;
+```
+
+Also inspect the sampling-sheet-level employee rows:
+
+```sql
+SELECT *
+FROM l_sampled_employees
+WHERE smst_smst_id = <SMST_ID>;
+```
+
+Inspect the exact analysis-target rows that will be removed:
+
+```sql
+SELECT *
+FROM l_analysis_targets
+WHERE smpl_smpl_id IN (<SMPL_ID_LIST>)
+ORDER BY smpl_smpl_id;
+```
+
+If other samples share the `SMST_ID`, do **not** delete `L_SAMPLED_EMPLOYEES` or `L_SAMPLE_SETS` merely because the requested samples are being deleted. If dependencies are uncertain, inspect `ALL_CONSTRAINTS` / `ALL_CONS_COLUMNS` before proceeding.
+
+### 5.3 Delete sample-level children
+
+Delete `ANALYSIS_TARGETS` first. For a live repair, prefer verified identifiers rather than relying only on a lab-number range:
+
+```sql
+DELETE FROM l_analysis_targets
+WHERE anly_id IN (<ANLY_ID_LIST>)
+  AND smpl_smpl_id IN (<SMPL_ID_LIST>);
+```
+
+The expected row count must equal the number of analysis-target rows identified during the pre-change inspection. Treat any other row count as a stop condition.
+
+Then remove any time-check rows:
+
+```sql
+DELETE FROM l_time_checks
+WHERE smpl_smpl_id IN (<SMPL_ID_LIST>);
+```
+
+The expected row count must match the pre-change inspection; zero rows is valid when no time checks exist.
+
+### 5.4 Delete the requested samples
+
+After their sample-level children are gone:
+
+```sql
+DELETE FROM l_samples
+WHERE smpl_id IN (<SMPL_ID_LIST>)
+  AND smst_smst_id = <SMST_ID>;
+```
+
+The expected row count must equal the number of requested samples associated with that parent.
+
+### 5.5 Remove sampling-sheet-level rows only when the entire parent is in scope
+
+If the blast-radius inspection established that the requested samples were the complete membership of the sampling sheet, delete its sampled-employee rows:
+
+```sql
+DELETE FROM l_sampled_employees
+WHERE smst_smst_id = <SMST_ID>;
+```
+
+Before deleting `L_SAMPLE_SETS`, perform a final parent-safety check:
+
+```sql
+SELECT
+    (SELECT COUNT(*)
+       FROM l_samples
+      WHERE smst_smst_id = <SMST_ID>) AS remaining_samples,
+    (SELECT COUNT(*)
+       FROM l_sampled_employees
+      WHERE smst_smst_id = <SMST_ID>) AS remaining_employees,
+    (SELECT COUNT(*)
+       FROM l_sample_sets
+      WHERE smst_id = <SMST_ID>) AS sample_set_rows
+FROM dual;
+```
+
+For a complete sampling-sheet deletion, the intended state immediately before parent deletion is `0` remaining samples, `0` remaining sampled employees, and exactly `1` sample-set row. If that condition is not met, stop and investigate.
+
+Then delete the parent:
+
+```sql
+DELETE FROM l_sample_sets
+WHERE smst_id = <SMST_ID>;
+```
+
+Expect exactly one row.
+
+### 5.6 Pre-commit and post-commit verification
+
+Before committing, verify that all intended rows are gone. Adapt the identifier lists to the actual case:
+
+```sql
+SELECT
+    (SELECT COUNT(*)
+       FROM l_analysis_targets
+      WHERE smpl_smpl_id IN (<SMPL_ID_LIST>)) AS analysis_targets,
+    (SELECT COUNT(*)
+       FROM l_time_checks
+      WHERE smpl_smpl_id IN (<SMPL_ID_LIST>)) AS time_checks,
+    (SELECT COUNT(*)
+       FROM l_samples
+      WHERE smpl_id IN (<SMPL_ID_LIST>)) AS samples,
+    (SELECT COUNT(*)
+       FROM l_sampled_employees
+      WHERE smst_smst_id = <SMST_ID>) AS sampled_employees,
+    (SELECT COUNT(*)
+       FROM l_sample_sets
+      WHERE smst_id = <SMST_ID>) AS sample_sets
+FROM dual;
+```
+
+For a complete sampling-sheet deletion, expect `0 / 0 / 0 / 0 / 0`. Do not commit if the result differs from the intended scope.
+
+```sql
+COMMIT;
+```
+
+For an important deletion, repeat the same verification after `COMMIT`. Before commit, `ROLLBACK;` remains available if any row count or verification result is unexpected. After commit, recovery requires compensating inserts/restoration and must not be improvised.
+
+### 5.7 Live verification — 2026-09-24
+
+An authorized request was received to remove five Mercury DOC samples that had been logged into LISA accidentally and were subsequently entered into LabWare. The case verified the complete `LISA-DELETE-001` workflow without generalizing beyond the observed dependencies.
+
+The five requested LISA samples shared one sampling-sheet parent. Pre-change inspection established:
+
+- 5 `SAMPLES` rows;
+- 5 `ANALYSIS_TARGETS` rows, one per sample;
+- 0 `TIME_CHECKS` rows;
+- 1 `SAMPLED_EMPLOYEES` row for the shared sampling sheet;
+- 1 `SAMPLE_SETS` parent; and
+- no additional samples sharing that `SMST_ID`.
+
+The child-to-parent deletion produced expected row counts of `5`, `0`, `5`, `1`, and `1` respectively. Consolidated verification returned `0 / 0 / 0 / 0 / 0` before commit and again after commit.
+
+**Scope limitation:** This live case verifies the documented objects and sequence for the observed deletion. It does **not** prove that these are the only possible dependencies for every LISA sample or sampling sheet. When the schema, sample type, or dependency pattern differs, use the schema-discovery procedure and constraint metadata rather than assuming the 2026-09-24 case is exhaustive.
 
 ---
 
@@ -1254,6 +1418,17 @@ This guide consolidates the following supplied materials:
 - **ERD5.pdf**, LIMS entity-relationship diagram (modified 2001) showing the conceptual relational model.
 - **Verified DBA session, 2026-09-01:** QC 521028–521031 unpost/theoretical-value correction, including live synonym/table discovery and inspection of `QC_DEV2.UPDATE_PRECS2`.
 - **Verified DBA session, 2026-09-01:** an existing LISA Oracle account was successfully unlocked using `ALTER USER ... ACCOUNT UNLOCK`.
+- **Verified DBA session, 2026-09-24:** `LISA-DELETE-001` end-to-end deletion of five accidentally logged samples sharing one sampling-sheet parent, including blast-radius inspection, child-before-parent deletion, and pre-/post-commit verification.
+
+### Verified 2026-09-24 sample-deletion findings retained as reusable knowledge
+
+- `LISA-DELETE-001` was live-verified end to end for a complete sampling-sheet deletion involving five accidentally logged samples.
+- Inspect all samples sharing the target `SMST_ID` before deciding whether sampling-sheet-level rows can be removed.
+- Verify `ANALYSIS_TARGETS` and `TIME_CHECKS` before deleting sample rows; expected zero-child counts are still explicitly checked.
+- Delete sample-level children before `SAMPLES`; delete `SAMPLED_EMPLOYEES` and `SAMPLE_SETS` only when the complete sampling sheet is confirmed to be in scope and no samples remain.
+- A parent-safety check immediately before deleting `SAMPLE_SETS` provides a clear stop condition if unexpected samples or sampled employees remain.
+- Run consolidated verification before commit and repeat it after commit for an important deletion.
+- The verified case does not establish that the observed child tables exhaust every possible dependency; use constraint/schema discovery when the dependency pattern is uncertain.
 
 ### Verified 2026-09-01 QC findings retained as reusable knowledge
 
